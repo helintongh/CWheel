@@ -12,9 +12,11 @@ add_subdirectory(math)
 # 设置项目编译头文件搜索路径 -I
 # 变量PROJECT_SOURCE_DIR是当前cmake的路径
 include_directories(${PROJECT_SOURCE_DIR}/math)
+# 设置项目库文件搜索路径 -L
+link_directories(${PROJECT_SOURCE_DIR}/math)
 
 # 指定生成目标
 add_executable(Demo ${SOURCE_FILE})
-# 设置项目库文件搜索路径 -L
+# 设置要链接的静态库 -L
 target_link_libraries(Demo MathFunctions)
 

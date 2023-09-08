@@ -30,6 +30,9 @@
 #include <stddef.h>
 #include <string.h>
 
+#include <string_view>
+
+
 #ifdef CINATRA_SSE
 #ifdef _MSC_VER
 #include <nmmintrin.h>
@@ -42,26 +45,23 @@
 #include <immintrin.h>
 #endif
 
-#include <sys/types.h>
+#ifdef CINATRA_ARM_OPT
+#include <arm_neon.h>
+#endif
 
 #ifdef _MSC_VER
 #define ssize_t intptr_t
 #endif
 
-/* $Id: 67fd3ee74103ada60258d8a16e868f483abcca87 $ */
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace cinatra {
+struct http_header {
+  std::string_view name;
+  std::string_view value;
+};
+namespace detail {
 
 /* contains name and value of a header (name == NULL if is a continuing line
  * of a multiline header */
-struct phr_header {
-  const char *name;
-  size_t name_len;
-  const char *value;
-  size_t value_len;
-};
 
 /* returns number of bytes consumed if successful, -2 if request is partial,
  * -1 if failed */
@@ -137,6 +137,32 @@ struct phr_chunked_decoder {
   CHECK_EOF();          \
   EXPECT_CHAR_NO_CHECK(ch);
 
+#ifdef CINATRA_ARM_OPT
+#define ADVANCE_TOKEN(tok, toklen)                                            \
+  do {                                                                        \
+    const char *tok_start = buf;                                              \
+    int found2;                                                               \
+    buf = findchar_nonprintable_fast(buf, buf_end, &found2);                  \
+    if (!found2) {                                                            \
+      CHECK_EOF();                                                            \
+    }                                                                         \
+    while (1) {                                                               \
+      if (*buf == ' ') {                                                      \
+        break;                                                                \
+      }                                                                       \
+      else if (unlikely(!IS_PRINTABLE_ASCII(*buf))) {                         \
+        if ((unsigned char)*buf < '\040' || *buf == '\177') {                 \
+          *ret = -1;                                                          \
+          return NULL;                                                        \
+        }                                                                     \
+      }                                                                       \
+      ++buf;                                                                  \
+      CHECK_EOF();                                                            \
+    }                                                                         \
+    tok = tok_start;                                                          \
+    toklen = buf - tok_start;                                                 \
+  } while (0)
+#else
 #define ADVANCE_TOKEN(tok, toklen)                                            \
   do {                                                                        \
     const char *tok_start = buf;                                              \
@@ -162,6 +188,7 @@ struct phr_chunked_decoder {
     tok = tok_start;                                                          \
     toklen = buf - tok_start;                                                 \
   } while (0)
+#endif
 
 static const char *token_char_map =
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
@@ -205,6 +232,41 @@ static const char *findchar_fast(const char *buf, const char *buf_end,
   return buf;
 }
 
+static const char *findchar_nonprintable_fast(const char *buf, const char *buf_end, int *found)
+{
+#ifdef CINATRA_ARM_OPT
+    *found = 0;
+
+    const size_t block_size = sizeof(uint8x16_t) - 1;
+    const char *const end = (size_t)(buf_end - buf) >= block_size ? buf_end - block_size : buf;
+
+    for (; buf < end; buf += sizeof(uint8x16_t)) {
+      uint8x16_t v = vld1q_u8((const uint8_t *)buf);
+
+      v = vorrq_u8(vcltq_u8(v, vmovq_n_u8('\041')), vceqq_u8(v, vmovq_n_u8('\177')));
+
+      /* Pack the comparison result into 64 bits. */
+      const uint8x8_t rv = vshrn_n_u16(vreinterpretq_u16_u8(v), 4);
+      uint64_t offset = vget_lane_u64(vreinterpret_u64_u8(rv), 0);
+
+      if (offset) {
+        *found = 1;
+        __asm__("rbit %x0, %x0" : "+r"(offset));
+        static_assert(sizeof(unsigned long long) == sizeof(uint64_t), "Need the number of leading 0-bits in uint64_t.");
+        /* offset uses 4 bits per byte of input. */
+        buf += __builtin_clzll(offset) / 4;
+        break;
+      }
+    }
+
+    return buf;
+#else
+    static const char ALIGNED(16) ranges2[16] = "\000\040\177\177";
+
+    return findchar_fast(buf, buf_end, ranges2, 4, found);
+#endif
+}
+
 static const char *get_token_to_eol(const char *buf, const char *buf_end,
                                     const char **token, size_t *token_len,
                                     int *ret) {
@@ -221,6 +283,55 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end,
   buf = findchar_fast(buf, buf_end, ranges1, sizeof(ranges1) - 1, &found);
   if (found)
     goto FOUND_CTL;
+#elif defined(CINATRA_ARM_OPT)
+    const size_t block_size = 2 * sizeof(uint8x16_t) - 1;
+    const char *const end = (size_t)(buf_end - buf) >= block_size ? buf_end - block_size : buf;
+
+    for (; buf < end; buf += 2 * sizeof(uint8x16_t)) {
+      const uint8x16_t space = vmovq_n_u8('\040');
+      const uint8x16_t threshold = vmovq_n_u8(0137u);
+      const uint8x16_t v1 = vld1q_u8((const uint8_t *)buf);
+      const uint8x16_t v2 = vld1q_u8((const uint8_t *)buf + sizeof(v1));
+      uint8x16_t v3 = vsubq_u8(v1, space);
+      uint8x16_t v4 = vsubq_u8(v2, space);
+
+      v3 = vcgeq_u8(v3, threshold);
+      v4 = vcgeq_u8(v4, threshold);
+      v3 = vorrq_u8(v3, v4);
+      /* Pack the comparison result into half a vector, i.e. 64 bits. */
+      v3 = vpmaxq_u8(v3, v3);
+
+      if (vgetq_lane_u64(vreinterpretq_u64_u8(v3), 0)) {
+        const uint8x16_t del = vmovq_n_u8('\177');
+        /* This mask makes it possible to pack the comparison results into half a vector,
+          * which has the same size as uint64_t. */
+        const uint8x16_t mask = vreinterpretq_u8_u32(vmovq_n_u32(0x40100401));
+        const uint8x16_t tab = vmovq_n_u8('\011');
+
+        v3 = vcltq_u8(v1, space);
+        v4 = vcltq_u8(v2, space);
+        v3 = vbicq_u8(v3, vceqq_u8(v1, tab));
+        v4 = vbicq_u8(v4, vceqq_u8(v2, tab));
+        v3 = vorrq_u8(v3, vceqq_u8(v1, del));
+        v4 = vorrq_u8(v4, vceqq_u8(v2, del));
+        /* After masking, four consecutive bytes in the results do not have the same bits set. */
+        v3 = vandq_u8(v3, mask);
+        v4 = vandq_u8(v4, mask);
+        /* Pack the comparison results into 128, and then 64 bits. */
+        v3 = vpaddq_u8(v3, v4);
+        v3 = vpaddq_u8(v3, v3);
+
+        uint64_t offset = vgetq_lane_u64(vreinterpretq_u64_u8(v3), 0);
+
+        if (offset) {
+          __asm__("rbit %x0, %x0" : "+r"(offset));
+          static_assert(sizeof(unsigned long long) == sizeof(uint64_t), "Need the number of leading 0-bits in uint64_t.");
+          /* offset uses 2 bits per byte of input. */
+          buf += __builtin_clzll(offset) / 2;
+          goto FOUND_CTL;
+        }
+      }
+    }
 #else
   /* find non-printable char within the next 8 bytes, this is the hottest code;
    * manually inlined */
@@ -652,10 +763,13 @@ static const char* parse_headers(const char* buf, const char* buf_end,
 #else
 
 static const char *parse_headers(const char *buf, const char *buf_end,
-                                 struct phr_header *headers,
-                                 size_t *num_headers, size_t max_headers,
-                                 int *ret) {
+                                 http_header *headers, size_t *num_headers,
+                                 size_t max_headers, int *ret) {
   for (;; ++*num_headers) {
+    const char *name;
+    size_t name_len;
+    const char *value;
+    size_t value_len;
     CHECK_EOF();
     if (*buf == '\015') {
       ++buf;
@@ -673,7 +787,7 @@ static const char *parse_headers(const char *buf, const char *buf_end,
     if (!(*num_headers != 0 && (*buf == ' ' || *buf == '\t'))) {
       /* parsing name, but do not discard SP before colon, see
        * http://www.mozilla.org/security/announce/2006/mfsa2006-33.html */
-      headers[*num_headers].name = buf;
+      name = buf;
       static const char ALIGNED(16) ranges1[] =
           "\x00 "  /* control chars and up to SP */
           "\"\""   /* 0x22 */
@@ -699,8 +813,7 @@ static const char *parse_headers(const char *buf, const char *buf_end,
         ++buf;
         CHECK_EOF();
       }
-      if ((headers[*num_headers].name_len = buf - headers[*num_headers].name) ==
-          0) {
+      if ((name_len = buf - name) == 0) {
         *ret = -1;
         return NULL;
       }
@@ -713,14 +826,15 @@ static const char *parse_headers(const char *buf, const char *buf_end,
       }
     }
     else {
-      headers[*num_headers].name = NULL;
-      headers[*num_headers].name_len = 0;
+      name = NULL;
+      name_len = 0;
     }
-    if ((buf = get_token_to_eol(buf, buf_end, &headers[*num_headers].value,
-                                &headers[*num_headers].value_len, ret)) ==
+    if ((buf = get_token_to_eol(buf, buf_end, &value, &value_len, ret)) ==
         NULL) {
       return NULL;
     }
+    headers[*num_headers] = {std::string_view{name, name_len},
+                             std::string_view{value, value_len}};
   }
   return buf;
 }
@@ -730,7 +844,7 @@ static const char *parse_headers(const char *buf, const char *buf_end,
 static const char *parse_request(const char *buf, const char *buf_end,
                                  const char **method, size_t *method_len,
                                  const char **path, size_t *path_len,
-                                 int *minor_version, struct phr_header *headers,
+                                 int *minor_version, http_header *headers,
                                  size_t *num_headers, size_t max_headers,
                                  int *ret) {
   /* skip first empty line (some clients add CRLF after POST content) */
@@ -769,7 +883,7 @@ static const char *parse_request(const char *buf, const char *buf_end,
 inline int phr_parse_request(const char *buf_start, size_t len,
                              const char **method, size_t *method_len,
                              const char **path, size_t *path_len,
-                             int *minor_version, struct phr_header *headers,
+                             int *minor_version, http_header *headers,
                              size_t *num_headers, size_t last_len) {
   const char *buf = buf_start, *buf_end = buf_start + len;
   size_t max_headers = *num_headers;
@@ -800,9 +914,8 @@ inline int phr_parse_request(const char *buf_start, size_t len,
 inline const char *parse_response(const char *buf, const char *buf_end,
                                   int *minor_version, int *status,
                                   const char **msg, size_t *msg_len,
-                                  struct phr_header *headers,
-                                  size_t *num_headers, size_t max_headers,
-                                  int *ret) {
+                                  http_header *headers, size_t *num_headers,
+                                  size_t max_headers, int *ret) {
   /* parse "HTTP/1.x" */
   if ((buf = parse_http_version(buf, buf_end, minor_version, ret)) == NULL) {
     return NULL;
@@ -835,7 +948,7 @@ inline const char *parse_response(const char *buf, const char *buf_end,
 
 inline int phr_parse_response(const char *buf_start, size_t len,
                               int *minor_version, int *status, const char **msg,
-                              size_t *msg_len, struct phr_header *headers,
+                              size_t *msg_len, http_header *headers,
                               size_t *num_headers, size_t last_len) {
   const char *buf = buf_start, *buf_end = buf + len;
   size_t max_headers = *num_headers;
@@ -862,7 +975,7 @@ inline int phr_parse_response(const char *buf_start, size_t len,
 }
 
 inline int phr_parse_headers(const char *buf_start, size_t len,
-                             struct phr_header *headers, size_t *num_headers,
+                             http_header *headers, size_t *num_headers,
                              size_t last_len) {
   const char *buf = buf_start, *buf_end = buf + len;
   size_t max_headers = *num_headers;
@@ -1027,13 +1140,10 @@ Exit:
 inline int phr_decode_chunked_is_in_data(struct phr_chunked_decoder *decoder) {
   return decoder->_state == CHUNKED_IN_CHUNK_DATA;
 }
-
+}  // namespace detail
+}  // namespace cinatra
 #undef CHECK_EOF
 #undef EXPECT_CHAR
 #undef ADVANCE_TOKEN
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

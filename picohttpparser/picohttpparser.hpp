@@ -601,7 +601,7 @@ static void find_ranges(const char* buf, const char* buf_end, unsigned long *ran
 }
 
 static const char* parse_headers(const char* buf, const char* buf_end, 
-                                 struct phr_header* headers,
+                                 http_header *headers,
                                  size_t* num_headers, size_t max_headers,
                                  int* ret)
 {
@@ -615,6 +615,10 @@ static const char* parse_headers(const char* buf, const char* buf_end,
   int n_headers = *num_headers;
 
   for (; ; ++n_headers) {
+    const char *name;
+    size_t name_len;
+    const char *value;
+    size_t value_len;
     CHECK_EOF();
     if (*buf == '\015') {
       ++buf;
@@ -636,7 +640,7 @@ static const char* parse_headers(const char* buf, const char* buf_end,
         *num_headers = n_headers;
         return NULL;
       }
-      headers[n_headers].name = buf;
+      name = buf;
  
       /* Attempt to find a match in the index */
       found = 0;
@@ -683,7 +687,7 @@ static const char* parse_headers(const char* buf, const char* buf_end,
           *num_headers = n_headers;
           return NULL;
         }
-      headers[n_headers].name_len = buf - headers[n_headers].name;
+      name_len = buf - name;
       ++buf;
       CHECK_EOF();
       while( (*buf == ' ' || *buf == '\t') ) {
@@ -691,8 +695,8 @@ static const char* parse_headers(const char* buf, const char* buf_end,
         CHECK_EOF();
       }
     } else {
-      headers[n_headers].name = NULL;
-      headers[n_headers].name_len = 0;
+      name = NULL;
+      name_len = 0;
     }
     const char* token_start = buf;
 
@@ -744,17 +748,19 @@ static const char* parse_headers(const char* buf, const char* buf_end,
     unsigned short two_char = *(unsigned short*)buf;
 
     if( likely(two_char == 0x0a0d) ) {
-      headers[n_headers].value_len = buf - token_start;
+      value_len = buf - token_start;
       buf += 2;
     } else if (unlikely(two_char & 0x0a == 0x0a)) {
-      headers[n_headers].value_len = buf - token_start;
+      value_len = buf - token_start;
       ++buf;
     } else {
       *ret = -1;
       *num_headers = n_headers;
       return NULL;
     }
-    headers[n_headers].value = token_start;
+    value = token_start;
+headers[*num_headers] = {std::string_view{name, name_len},
+                             std::string_view{value, value_len}};
   }
   *num_headers = n_headers;
   return buf;
@@ -1147,3 +1153,4 @@ inline int phr_decode_chunked_is_in_data(struct phr_chunked_decoder *decoder) {
 #undef ADVANCE_TOKEN
 
 #endif
+

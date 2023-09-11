@@ -28,7 +28,7 @@ int main(void)
     const char *path;
     size_t path_len;
     int minor_version;
-    struct phr_header headers[32];
+    struct cinatra::http_header headers[32];
     size_t num_headers;
     int i, ret;
 
@@ -37,7 +37,7 @@ int main(void)
 
     for (i = 0; i < 5000000; i++) {
         num_headers = sizeof(headers) / sizeof(headers[0]);
-        ret = phr_parse_request(REQ, sizeof(REQ) - 1, &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers,
+        ret = cinatra::detail::phr_parse_request(REQ, sizeof(REQ) - 1, &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers,
                                 0);
         assert(ret == sizeof(REQ) - 1);
     }

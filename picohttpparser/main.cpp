@@ -28,7 +28,7 @@ int main(void)
     const char *path;
     size_t path_len;
     int minor_version;
-    struct cinatra::http_header headers[32];
+    cinatra::http_header headers[64];
     size_t num_headers;
     int i, ret;
 
@@ -41,9 +41,27 @@ int main(void)
                                 0);
         assert(ret == sizeof(REQ) - 1);
     }
+
     end = (float)clock()/CLOCKS_PER_SEC;
     
     printf("Elapsed %f seconds.\n", (end - start));
+
+    /*
+    基本功能测试
+    num_headers = sizeof(headers) / sizeof(headers[0]);
+    int pret = cinatra::detail::phr_parse_request(REQ, sizeof(REQ) - 1, &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers,
+                                0);
+    printf("request is %d bytes long\n", pret);
+    printf("method is %.*s\n", (int)method_len, method);
+    printf("path is %.*s\n", (int)path_len, path);
+    printf("HTTP version is 1.%d\n", minor_version);
+    printf("num of headers is %ld\n", num_headers);
+    printf("headers:\n");
+    for (i = 0; i != num_headers; ++i)
+    {
+        std::cout << std::string(headers[i].name) << "header's value is: " << std::string(headers[i].value) << std::endl;
+    }
+    */
 
     return 0;
 }
